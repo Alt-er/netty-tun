@@ -21,9 +21,11 @@
  */
 package org.drasyl.channel.tun.jna.darwin;
 
+import com.sun.jna.Native;
 import com.sun.jna.NativeLong;
 import com.sun.jna.Structure;
 import com.sun.jna.Structure.FieldOrder;
+import com.sun.jna.ptr.IntByReference;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.CompositeByteBuf;
@@ -33,17 +35,30 @@ import org.drasyl.channel.tun.TunAddress;
 import org.drasyl.channel.tun.TunPacket;
 import org.drasyl.channel.tun.jna.AbstractTunDevice;
 import org.drasyl.channel.tun.jna.TunDevice;
+import org.drasyl.channel.tun.jna.shared.If;
 import org.drasyl.channel.tun.jna.shared.LibC;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
+import static org.drasyl.channel.tun.jna.darwin.IfUtun.UTUN_CONTROL_NAME;
+import static org.drasyl.channel.tun.jna.darwin.IfUtun.UTUN_OPT_IFNAME;
+import static org.drasyl.channel.tun.jna.darwin.Ioctl.SIOCGIFMTU;
+import static org.drasyl.channel.tun.jna.darwin.Ioctl.SIOCSIFMTU;
+import static org.drasyl.channel.tun.jna.darwin.KernControl.CTLIOCGINFO;
+import static org.drasyl.channel.tun.jna.darwin.SysDomain.SYSPROTO_CONTROL;
+import static org.drasyl.channel.tun.jna.shared.LibC.connect;
+import static org.drasyl.channel.tun.jna.shared.LibC.getsockopt;
+import static org.drasyl.channel.tun.jna.shared.LibC.ioctl;
 import static org.drasyl.channel.tun.jna.shared.LibC.read;
+import static org.drasyl.channel.tun.jna.shared.LibC.socket;
 import static org.drasyl.channel.tun.jna.shared.LibC.write;
 import static org.drasyl.channel.tun.jna.shared.Socket.ADDRESS_FAMILY_SIZE;
 import static org.drasyl.channel.tun.jna.shared.Socket.AF_INET;
 import static org.drasyl.channel.tun.jna.shared.Socket.AF_INET6;
+import static org.drasyl.channel.tun.jna.shared.Socket.AF_SYSTEM;
+import static org.drasyl.channel.tun.jna.shared.Socket.SOCK_DGRAM;
 
 /**
  * {@link TunDevice} implementation for Darwin-based platforms.
@@ -64,65 +79,73 @@ public final class DarwinTunDevice extends AbstractTunDevice {
     }
 
     public static TunDevice open(final String name, int mtu) throws IOException {
-//        final int index;
-//        if (name != null) {
-//            if (name.startsWith(DEVICE_PREFIX)) {
-//                try {
-//                    index = Integer.parseInt(name.substring(DEVICE_PREFIX.length()));
-//                }
-//                catch (final NumberFormatException e) {
-//                    throw ILLEGAL_NAME_EXCEPTION;
-//                }
-//            }
-//            else {
-//                throw ILLEGAL_NAME_EXCEPTION;
-//            }
-//        }
-//        else {
-//            index = 0;
-//        }
-//
-//        // create socket
-//        final int fd = socket(AF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
-//
-//        if (fd == -1) {
-//            throw new IOException("Create an endpoint for communication failed.");
-//        }
-//
-//        // mark socket as utun device
-//        final CtlInfo ctlInfo = new CtlInfo(UTUN_CONTROL_NAME);
-//        ioctl(fd, CTLIOCGINFO, ctlInfo);
-//
-//        // define address of socket
-//        final SockaddrCtl address = new SockaddrCtl(AF_SYSTEM, (short) SYSPROTO_CONTROL, ctlInfo.ctl_id, index);
-//        connect(fd, address, address.sc_len);
-//
-//        // get socket name
-//        final SockName sockName = new SockName();
-//        final IntByReference sockNameLen = new IntByReference(SockName.LENGTH);
-//        getsockopt(fd, SYSPROTO_CONTROL, UTUN_OPT_IFNAME, sockName, sockNameLen);
-//
-//        final String deviceName = Native.toString(sockName.name, US_ASCII);
-//
-//        if (mtu != 0) {
-//            // set mtu
-//            final Ifreq ifreq = new Ifreq(deviceName, mtu);
-//            ioctl(fd, SIOCSIFMTU, ifreq);
-//        }
-//        else {
-//            // get mtu
-//            final Ifreq ifreq = new Ifreq(deviceName);
-//            ioctl(fd, SIOCGIFMTU, ifreq);
-//            mtu = ifreq.ifr_ifru.ifru_mtu;
-//        }
+        String arch = System.getProperty("os.arch");
+        if (arch.equals("aarch64")) {
+            // 当前平台为 AArch64 架构
+            TunInfo tunInfo = new TunInfo();
+            tunInfo.mtu = mtu;
 
-        TunInfo tunInfo = new TunInfo();
-        tunInfo.mtu = mtu;
+            final int tun = CosyTunLibrary.INSTANCE.create_tun(tunInfo);
+            String deviceName = new String(tunInfo.device_name, US_ASCII).trim();
 
-        final int tun = CosyTunLibrary.INSTANCE.create_tun(tunInfo);
-        String deviceName = new String(tunInfo.device_name, US_ASCII).trim();
+            return new DarwinTunDevice(tunInfo.fd, tunInfo.mtu, new TunAddress(deviceName));
+        }
+        else {
+            // 当前平台不是 AArch64 架构
 
-        return new DarwinTunDevice(tunInfo.fd, tunInfo.mtu, new TunAddress(deviceName));
+            final int index;
+            if (name != null) {
+                if (name.startsWith(DEVICE_PREFIX)) {
+                    try {
+                        index = Integer.parseInt(name.substring(DEVICE_PREFIX.length()));
+                    }
+                    catch (final NumberFormatException e) {
+                        throw ILLEGAL_NAME_EXCEPTION;
+                    }
+                }
+                else {
+                    throw ILLEGAL_NAME_EXCEPTION;
+                }
+            }
+            else {
+                index = 0;
+            }
+
+            // create socket
+            final int fd = socket(AF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
+
+            if (fd == -1) {
+                throw new IOException("Create an endpoint for communication failed.");
+            }
+
+            // mark socket as utun device
+            final KernControl.CtlInfo ctlInfo = new KernControl.CtlInfo(UTUN_CONTROL_NAME);
+            ioctl(fd, CTLIOCGINFO, ctlInfo);
+
+            // define address of socket
+            final KernControl.SockaddrCtl address = new KernControl.SockaddrCtl(AF_SYSTEM, (short) SYSPROTO_CONTROL, ctlInfo.ctl_id, index);
+            connect(fd, address, address.sc_len);
+
+            // get socket name
+            final SockName sockName = new SockName();
+            final IntByReference sockNameLen = new IntByReference(SockName.LENGTH);
+            getsockopt(fd, SYSPROTO_CONTROL, UTUN_OPT_IFNAME, sockName, sockNameLen);
+
+            final String deviceName = Native.toString(sockName.name, US_ASCII);
+
+            if (mtu != 0) {
+                // set mtu
+                final If.Ifreq ifreq = new If.Ifreq(deviceName, mtu);
+                ioctl(fd, SIOCSIFMTU, ifreq);
+            }
+            else {
+                // get mtu
+                final If.Ifreq ifreq = new If.Ifreq(deviceName);
+                ioctl(fd, SIOCGIFMTU, ifreq);
+                mtu = ifreq.ifr_ifru.ifru_mtu;
+            }
+            return new DarwinTunDevice(fd, mtu, new TunAddress(deviceName));
+        }
     }
 
     @Override
